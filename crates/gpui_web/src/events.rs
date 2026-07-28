@@ -66,6 +66,8 @@ impl WebWindowInner {
             self.register_dragleave(),
             self.register_key_down(),
             self.register_key_up(),
+            self.register_before_input(),
+            self.register_input(),
             self.register_composition_start(),
             self.register_composition_update(),
             self.register_composition_end(),
@@ -477,6 +479,63 @@ impl WebWindowInner {
             };
 
             this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+        })
+    }
+
+    fn register_before_input(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen_input("beforeinput", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+
+            // Key presses are inserted from `keydown`, while IME text is
+            // installed by the composition handlers below. Browser-native
+            // text services such as the macOS emoji picker have neither:
+            // they insert directly through `beforeinput`.
+            if this.is_composing.get()
+                || event.is_composing()
+                || !event.input_type().starts_with("insert")
+                || event.input_type().contains("Composition")
+            {
+                return;
+            }
+
+            let Some(text) = event.data().filter(|text| !text.is_empty()) else {
+                return;
+            };
+            event.prevent_default();
+            this.with_input_handler(|handler| {
+                handler.replace_text_in_range(None, &text);
+            });
+            this.input_element.set_value("");
+        })
+    }
+
+    fn register_input(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen_input("input", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+
+            // Some browser-native text services skip `beforeinput`. In that
+            // case the browser has already placed the inserted text in our
+            // otherwise-empty hidden input. Composition owns its own path and
+            // clears this value on completion, so never consume it here while
+            // composition is active.
+            if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+            if event.input_type().contains("Composition") {
+                this.input_element.set_value("");
+                return;
+            }
+
+            let text = this.input_element.value();
+            if text.is_empty() {
+                return;
+            }
+            this.input_element.set_value("");
+            this.with_input_handler(|handler| {
+                handler.replace_text_in_range(None, &text);
+            });
         })
     }
 
