@@ -58,6 +58,11 @@ const GPUI_VIEW_IVAR: &str = "gpui_view";
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
 
 const FLING_THRESHOLD: f32 = 50.0;
+// A finger that has come to rest before lifting is not a flick. UIKit sends no
+// moves while it is stationary, so the tracked velocity keeps whatever the last
+// motion left there; without this, a touch that pans and then pauses flings on
+// release.
+const FLING_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const TEXT_INTERACTION_NONE: i8 = -1;
 const TEXT_INTERACTION_NONEDITABLE: i8 = 0;
 const TEXT_INTERACTION_EDITABLE: i8 = 1;
@@ -4115,14 +4120,33 @@ impl IosWindow {
                 }
                 // Start fling if velocity exceeds threshold
                 if phase == UITouchPhase::Ended && !self.touch_scroll_suppressed.get() {
-                    let vx = self.touch_velocity_x.get();
-                    let vy = self.touch_velocity_y.get();
+                    let now = std::time::Instant::now();
+                    let resting = self
+                        .touch_last_time
+                        .borrow()
+                        .is_none_or(|last| now.duration_since(last) > FLING_IDLE_TIMEOUT);
+                    let vx = if resting {
+                        0.0
+                    } else {
+                        self.touch_velocity_x.get()
+                    };
+                    let vy = if resting {
+                        0.0
+                    } else {
+                        self.touch_velocity_y.get()
+                    };
                     if vx.abs() > FLING_THRESHOLD || vy.abs() > FLING_THRESHOLD {
                         *self.fling.borrow_mut() = Some(TouchFling {
                             velocity_x: vx,
                             velocity_y: vy,
-                            last_time: std::time::Instant::now(),
-                            position,
+                            last_time: now,
+                            // Deceleration belongs to whatever the pan was
+                            // moving, exactly like the moved events above: they
+                            // are dispatched from the down position, so a fling
+                            // sent from the lift position would hit-test a
+                            // different element and hand the momentum to it, or
+                            // to nothing at all.
+                            position: self.touch_down_position.get(),
                         });
                     }
                 }
