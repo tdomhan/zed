@@ -95,7 +95,15 @@ fn edit_menu_action_policy(
     }
 }
 
-fn should_consume_touch_for_selection_dismissal(
+/// Whether a touch that begins away from the active selection should collapse
+/// it.
+///
+/// Dismissing the selection is all this decides. The touch itself is still
+/// delivered to GPUI, because a tap that lands on a button has to activate it
+/// and a drag has to scroll, exactly as they do when no text is selected —
+/// UIKit's own text views behave the same way, moving the caret on the tap that
+/// dismisses a selection rather than swallowing it.
+fn should_dismiss_selection_for_touch(
     had_selection: bool,
     hit_text: bool,
     hit_selection_area: bool,
@@ -3360,9 +3368,6 @@ pub(crate) struct IosWindow {
     /// True once a pointer handler claims the active touch stream and suppresses
     /// the platform's synthetic scroll events for that stream.
     touch_scroll_suppressed: Cell<bool>,
-    /// True when this touch stream only dismissed native text selection. The
-    /// same touch must not continue into GPUI press/scroll handling.
-    touch_selection_dismissal_suppressed: Cell<bool>,
     /// Timestamp of the last dispatched Moved event (UITouch.timestamp, seconds since boot).
     /// Used to skip duplicate Moved callbacks that UIKit fires for the same touch sample.
     last_move_ts: Cell<f64>,
@@ -3513,7 +3518,6 @@ impl IosWindow {
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
                 touch_scroll_suppressed: Cell::new(false),
-                touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             };
 
@@ -3656,7 +3660,6 @@ impl IosWindow {
                 fling: RefCell::new(None),
                 touch_down_position: Cell::new(Point::default()),
                 touch_scroll_suppressed: Cell::new(false),
-                touch_selection_dismissal_suppressed: Cell::new(false),
                 last_move_ts: Cell::new(0.0),
             })
         }
@@ -3985,7 +3988,6 @@ impl IosWindow {
                     let tap_count: usize = unsafe { msg_send![touch, tapCount] };
                     self.last_touch_tap_count.set(tap_count);
                     self.touch_scroll_suppressed.set(false);
-                    self.touch_selection_dismissal_suppressed.set(false);
                     let now = std::time::Instant::now();
                     *self.touch_last_time.borrow_mut() = Some(now);
                     *self.primary_touch_began_at.borrow_mut() = Some(now);
@@ -3998,24 +4000,21 @@ impl IosWindow {
                     let hit_selection_area =
                         hit_registered_selection_area || hit_active_selection_area;
                     self.touch_pressed.set(true);
-                    if should_consume_touch_for_selection_dismissal(
+                    if should_dismiss_selection_for_touch(
                         had_selection,
                         hit_text,
                         hit_selection_area,
                     ) {
                         self.clear_active_text_selection(true);
-                        self.touch_selection_dismissal_suppressed.set(true);
-                        None
-                    } else if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                    }
+                    if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                         callback(touch_began_to_pointer_down(
                             position,
                             touch_ptr as u64,
                             modifiers,
                         ));
-                        None
-                    } else {
-                        None
                     }
+                    None
                 } else {
                     // Secondary finger down — cancel fling/velocity to prevent
                     // cross-contamination with the primary finger's scroll state.
@@ -4027,9 +4026,6 @@ impl IosWindow {
             }
             UITouchPhase::Moved => {
                 if touch_ptr != self.primary_touch_ptr.get() {
-                    return;
-                }
-                if self.touch_selection_dismissal_suppressed.get() {
                     return;
                 }
                 // Skip duplicate Moved callbacks: UIKit sometimes delivers the same touch
@@ -4087,11 +4083,6 @@ impl IosWindow {
                 self.primary_touch_ptr.set(0);
                 self.primary_touch_began_at.borrow_mut().take();
                 self.touch_pressed.set(false);
-                let selection_dismissal = self.touch_selection_dismissal_suppressed.replace(false);
-                if selection_dismissal {
-                    self.touch_scroll_suppressed.set(false);
-                    return;
-                }
                 let pointer_result =
                     if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
                         if phase == UITouchPhase::Cancelled {
@@ -4952,19 +4943,11 @@ mod tests {
     }
 
     #[test]
-    fn outside_selection_touch_is_consumed_only_for_dismissal() {
-        assert!(should_consume_touch_for_selection_dismissal(
-            true, false, false
-        ));
-        assert!(!should_consume_touch_for_selection_dismissal(
-            true, true, false
-        ));
-        assert!(!should_consume_touch_for_selection_dismissal(
-            true, false, true
-        ));
-        assert!(!should_consume_touch_for_selection_dismissal(
-            false, false, false
-        ));
+    fn touch_outside_the_selection_dismisses_it() {
+        assert!(should_dismiss_selection_for_touch(true, false, false));
+        assert!(!should_dismiss_selection_for_touch(true, true, false));
+        assert!(!should_dismiss_selection_for_touch(true, false, true));
+        assert!(!should_dismiss_selection_for_touch(false, false, false));
     }
 
     #[test]
