@@ -188,6 +188,11 @@ impl Application {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
         }));
+        // Native platform loops keep `Application` alive until quit. The web
+        // platform schedules startup and returns immediately, so retain the
+        // application owner for the lifetime of the browser page.
+        #[cfg(target_family = "wasm")]
+        std::mem::forget(self);
     }
 
     /// Register a handler to be invoked when the platform instructs the application

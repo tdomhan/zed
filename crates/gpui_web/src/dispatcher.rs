@@ -23,6 +23,11 @@ fn shared_memory_supported() -> bool {
     has_shared_array_buffer && has_atomics && is_shared_buffer
 }
 
+#[cfg(not(feature = "multithreaded"))]
+fn shared_memory_supported() -> bool {
+    false
+}
+
 enum MainThreadItem {
     Runnable(RunnableVariant),
     Delayed {
@@ -139,6 +144,8 @@ unsafe impl Sync for WebDispatcher {}
 
 impl WebDispatcher {
     pub fn new(browser_window: web_sys::Window, allow_threads: bool) -> Self {
+        #[cfg(not(feature = "multithreaded"))]
+        let _ = allow_threads;
         #[cfg(feature = "multithreaded")]
         let (background_sender, background_receiver) = PriorityQueueReceiver::new();
         #[cfg(not(feature = "multithreaded"))]
