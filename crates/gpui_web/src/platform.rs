@@ -11,8 +11,9 @@ use gpui::{
     ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_wgpu::WgpuContext;
+#[cfg(feature = "bundled-fonts")]
+use std::borrow::Cow;
 use std::{
-    borrow::Cow,
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::Rc,
@@ -20,6 +21,7 @@ use std::{
 };
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "bundled-fonts")]
 static BUNDLED_FONTS: &[&[u8]] = &[
     include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
     include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
@@ -70,12 +72,15 @@ impl WebPlatform {
         let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
             "IBM Plex Sans",
         ));
-        let fonts = BUNDLED_FONTS
-            .iter()
-            .map(|bytes| Cow::Borrowed(*bytes))
-            .collect();
-        if let Err(error) = text_system.add_fonts(fonts) {
-            log::error!("failed to load bundled fonts: {error:#}");
+        #[cfg(feature = "bundled-fonts")]
+        {
+            let fonts = BUNDLED_FONTS
+                .iter()
+                .map(|bytes| Cow::Borrowed(*bytes))
+                .collect();
+            if let Err(error) = text_system.add_fonts(fonts) {
+                log::error!("failed to load bundled fonts: {error:#}");
+            }
         }
         let text_system: Arc<dyn PlatformTextSystem> = text_system;
         let active_display: Rc<dyn PlatformDisplay> =

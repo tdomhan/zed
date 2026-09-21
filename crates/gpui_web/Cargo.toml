@@ -10,7 +10,8 @@ autoexamples = false
 workspace = true
 
 [features]
-default = ["multithreaded"]
+default = ["bundled-fonts", "multithreaded"]
+bundled-fonts = []
 multithreaded = ["dep:wasm_thread"]
 
 [lib]
