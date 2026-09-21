@@ -55,6 +55,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    frame_pending: Cell<bool>,
+    frame_callback: RefCell<Option<js_sys::Function>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
 }
@@ -182,6 +184,8 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            frame_pending: Cell::new(false),
+            frame_callback: RefCell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
         });
@@ -301,38 +305,55 @@ impl WebWindow {
 
 impl WebWindowInner {
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
-        let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
-        let raf_handle_inner = Rc::clone(&raf_handle);
-
-        let this = Rc::clone(self);
+        let weak = Rc::downgrade(self);
         let closure = Closure::new(move || {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            this.frame_pending.set(false);
+            if this
+                .browser_window
+                .document()
+                .is_some_and(|document| document.hidden())
             {
-                let mut callbacks = this.callbacks.borrow_mut();
-                if let Some(ref mut callback) = callbacks.request_frame {
-                    callback(RequestFrameOptions {
-                        require_presentation: true,
-                        force_render: false,
-                    });
-                }
+                return;
             }
-
-            // Re-schedule for the next frame
-            if let Some(ref func) = *raf_handle_inner.borrow() {
-                this.browser_window.request_animation_frame(func).ok();
+            let mut callbacks = this.callbacks.borrow_mut();
+            if let Some(callback) = &mut callbacks.request_frame {
+                callback(RequestFrameOptions {
+                    require_presentation: false,
+                    force_render: false,
+                });
             }
         });
-
-        let js_func: js_sys::Function =
-            closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
-        *raf_handle.borrow_mut() = Some(js_func);
-
+        *self.frame_callback.borrow_mut() = Some(
+            closure
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        );
         closure
     }
 
-    fn schedule_raf(&self, closure: &Closure<dyn FnMut()>) {
-        self.browser_window
-            .request_animation_frame(closure.as_ref().unchecked_ref())
-            .ok();
+    fn schedule_raf(&self, _closure: &Closure<dyn FnMut()>) {
+        self.request_frame();
+    }
+
+    fn request_frame(&self) {
+        if self.frame_pending.get()
+            || self
+                .browser_window
+                .document()
+                .is_some_and(|document| document.hidden())
+        {
+            return;
+        }
+        if let Some(callback) = self.frame_callback.borrow().as_ref() {
+            match self.browser_window.request_animation_frame(callback) {
+                Ok(_) => self.frame_pending.set(true),
+                Err(error) => log::error!("could not request animation frame: {error:?}"),
+            }
+        }
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
@@ -394,6 +415,9 @@ impl WebWindowInner {
             {
                 let mut state = this.state.borrow_mut();
                 state.is_active = is_visible;
+            }
+            if is_visible {
+                this.request_frame();
             }
             let mut callbacks = this.callbacks.borrow_mut();
             if let Some(ref mut callback) = callbacks.active_status_change {
@@ -622,6 +646,15 @@ impl PlatformWindow for WebWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.inner.state.borrow().is_fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let weak = Rc::downgrade(&self.inner);
+        Some(Rc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.request_frame();
+            }
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

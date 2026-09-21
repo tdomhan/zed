@@ -115,6 +115,7 @@ struct WindowInvalidatorInner {
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    pub platform_waker: Option<Rc<dyn Fn()>>,
 }
 
 #[derive(Clone)]
@@ -130,6 +131,7 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                platform_waker: None,
             })),
         }
     }
@@ -139,8 +141,14 @@ impl WindowInvalidator {
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
+            let became_dirty = !inner.dirty;
             inner.dirty = true;
+            let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+            drop(inner);
             cx.push_effect(Effect::Notify { emitter: entity });
+            if let Some(waker) = waker {
+                waker();
+            }
             true
         } else {
             false
@@ -153,9 +161,32 @@ impl WindowInvalidator {
 
     pub fn set_dirty(&self, dirty: bool) {
         let mut inner = self.inner.borrow_mut();
+        let became_dirty = dirty && !inner.dirty;
         inner.dirty = dirty;
         if dirty {
             inner.update_count += 1;
+        }
+        let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn set_platform_waker(&self, waker: Option<Rc<dyn Fn()>>) {
+        let mut inner = self.inner.borrow_mut();
+        inner.platform_waker = waker;
+        let waker = inner.dirty.then(|| inner.platform_waker.clone()).flatten();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn wake_platform(&self) {
+        let waker = self.inner.borrow().platform_waker.clone();
+        if let Some(waker) = waker {
+            waker();
         }
     }
 
@@ -1385,6 +1416,7 @@ impl Window {
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
+        invalidator.set_platform_waker(platform_window.frame_waker());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1427,9 +1459,11 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
-                    && !request_frame_options.require_presentation
-                    && next_frame_callbacks.borrow().is_empty()
+                // Web frames are one-shot; dropping one would strand queued callbacks.
+                let min_frame_interval = if cfg!(target_family = "wasm")
+                    || (!request_frame_options.force_render
+                        && !request_frame_options.require_presentation
+                        && next_frame_callbacks.borrow().is_empty())
                 {
                     None
                 } else if !active.get() {
@@ -2169,6 +2203,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.wake_platform();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -6370,6 +6405,25 @@ pub fn outline(
 mod tests {
     use super::*;
     use crate::{Empty, TestAppContext};
+
+    #[test]
+    fn platform_waker_runs_for_new_work() {
+        let invalidator = WindowInvalidator::new();
+        invalidator.set_dirty(false);
+
+        let wake_count = Rc::new(Cell::new(0));
+        let count = wake_count.clone();
+        invalidator.set_platform_waker(Some(Rc::new(move || count.set(count.get() + 1))));
+
+        invalidator.set_dirty(true);
+        assert_eq!(wake_count.get(), 1);
+
+        invalidator.set_dirty(true);
+        assert_eq!(wake_count.get(), 1);
+
+        invalidator.wake_platform();
+        assert_eq!(wake_count.get(), 2);
+    }
 
     #[test]
     fn reuse_paint_replays_manual_focus_handles() {
