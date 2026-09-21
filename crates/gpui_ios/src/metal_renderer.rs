@@ -56,7 +56,7 @@ pub(crate) unsafe fn new_renderer(
     context: self::Context,
     _native_window: *mut c_void,
     native_view: *mut c_void,
-    _bounds: gpui::Size<f32>,
+    bounds: gpui::Size<f32>,
     transparent: bool,
 ) -> Renderer {
     let mut renderer = MetalRenderer::new(context, transparent);
@@ -76,6 +76,16 @@ pub(crate) unsafe fn new_renderer(
         layer.set_maximum_drawable_count(3);
         renderer.layer = layer;
     }
+
+    // Path rendering uses full-size intermediate textures. Resize events keep
+    // these textures current, but the first non-zero drawable size is already
+    // known here and a resize is not guaranteed before the initial frames.
+    // Without this initialization, the first scene containing a vector path is
+    // rejected and incorrectly reported as exceeding the instance buffer.
+    renderer.update_drawable_size(Size {
+        width: DevicePixels(bounds.width.ceil() as i32),
+        height: DevicePixels(bounds.height.ceil() as i32),
+    });
 
     renderer
 }
