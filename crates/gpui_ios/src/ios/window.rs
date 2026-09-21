@@ -811,6 +811,26 @@ fn has_active_selection_geometry(view: &Object) -> bool {
     }
 }
 
+/// Whether a text-position query belongs to a gesture UIKit has already
+/// started, rather than to a fresh one it is deciding whether to begin.
+///
+/// A caret drag qualifies just as much as a selection-handle drag: the finger
+/// leaves the text almost immediately in both cases, and a collapsed selection
+/// caches no geometry, so a finger-down check is what keeps the caret tracking.
+fn text_position_query_is_mid_interaction(view: &Object) -> bool {
+    if has_active_selection_geometry(view) {
+        return true;
+    }
+    unsafe {
+        let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return false;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+        window.touch_pressed.get()
+    }
+}
+
 fn sync_text_interaction_for_view(view: &Object) {
     unsafe {
         let window_ptr: *mut std::ffi::c_void = *view.get_ivar(GPUI_WINDOW_IVAR);
@@ -2681,10 +2701,10 @@ fn register_metal_view_class() -> &'static Class {
                     return ptr::null_mut();
                 }
                 let point = Point::new(px(point.x as f32), px(point.y as f32));
-                let has_active_selection = has_active_selection_geometry(this);
+                let mid_interaction = text_position_query_is_mid_interaction(this);
                 let (direct_index, nearest_index) = with_input_handler(this, |handler| {
                     let direct_index = handler.character_index_for_point(point);
-                    let nearest_index = if direct_index.is_none() && has_active_selection {
+                    let nearest_index = if direct_index.is_none() && mid_interaction {
                         handler.nearest_character_index_for_point(point)
                     } else {
                         None
