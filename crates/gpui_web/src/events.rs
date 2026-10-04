@@ -10,7 +10,10 @@ use gpui::{
 use smallvec::smallvec;
 use wasm_bindgen::prelude::*;
 
-use crate::window::WebWindowInner;
+use crate::{
+    input::{before_input_text, input_text},
+    window::WebWindowInner,
+};
 
 pub struct WebEventListeners {
     #[allow(dead_code)]
@@ -491,20 +494,18 @@ impl WebWindowInner {
             // installed by the composition handlers below. Browser-native
             // text services such as the macOS emoji picker have neither:
             // they insert directly through `beforeinput`.
-            if this.is_composing.get()
-                || event.is_composing()
-                || !event.input_type().starts_with("insert")
-                || event.input_type().contains("Composition")
-            {
-                return;
-            }
-
-            let Some(text) = event.data().filter(|text| !text.is_empty()) else {
+            let data = event.data();
+            let Some(text) = before_input_text(
+                this.is_composing.get() || event.is_composing(),
+                &event.input_type(),
+                data.as_deref(),
+                event.cancelable(),
+            ) else {
                 return;
             };
             event.prevent_default();
             this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &text);
+                handler.replace_text_in_range(None, text);
             });
             this.input_element.set_value("");
         })
@@ -515,9 +516,8 @@ impl WebWindowInner {
         self.listen_input("input", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
 
-            // Some browser-native text services skip `beforeinput`. In that
-            // case the browser has already placed the inserted text in our
-            // otherwise-empty hidden input. Composition owns its own path and
+            // Missing or non-cancellable beforeinput leaves the browser mutation
+            // for this handler to consume. Composition owns its own path and
             // clears this value on completion, so never consume it here while
             // composition is active.
             if this.is_composing.get() || event.is_composing() {
@@ -529,12 +529,12 @@ impl WebWindowInner {
             }
 
             let text = this.input_element.value();
-            if text.is_empty() {
+            let Some(text) = input_text(false, &event.input_type(), &text) else {
                 return;
-            }
+            };
             this.input_element.set_value("");
             this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &text);
+                handler.replace_text_in_range(None, text);
             });
         })
     }
