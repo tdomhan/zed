@@ -58,6 +58,16 @@ struct LoadedFont {
     weight: cosmic_text::Weight,
 }
 
+impl LoadedFont {
+    fn normalized_coords(&self) -> SmallVec<[swash::NormalizedCoord; 4]> {
+        self.font
+            .as_swash()
+            .variations()
+            .normalized_coords([("wght", f32::from(self.weight.0))])
+            .collect()
+    }
+}
+
 impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new();
@@ -128,13 +138,29 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        let metrics = self
-            .0
-            .read()
-            .loaded_font(font_id)
+        let state = self.0.read();
+        let loaded_font = state.loaded_font(font_id);
+        let mut metrics = loaded_font
             .font
             .as_swash()
-            .metrics(&[]);
+            .metrics(&loaded_font.normalized_coords());
+        if has_weight_axis(&loaded_font.font) {
+            // Cosmic's instantiated metrics also apply MVAR decoration deltas correctly.
+            let instance = loaded_font.font.metrics();
+            metrics.ascent = instance.ascent;
+            metrics.descent = instance.descent;
+            metrics.leading = instance.leading;
+            if let Some(height) = instance.cap_height {
+                metrics.cap_height = height;
+            }
+            if let Some(height) = instance.x_height {
+                metrics.x_height = height;
+            }
+            if let Some(underline) = instance.underline {
+                metrics.underline_offset = underline.offset;
+                metrics.stroke_size = underline.thickness;
+            }
+        }
 
         FontMetrics {
             units_per_em: metrics.units_per_em as u32,
@@ -154,7 +180,9 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
         let lock = self.0.read();
-        let glyph_metrics = lock.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
+        let loaded_font = lock.loaded_font(font_id);
+        let coords = loaded_font.normalized_coords();
+        let glyph_metrics = loaded_font.font.as_swash().glyph_metrics(&coords);
         let glyph_id = glyph_id.0 as u16;
         Ok(Bounds {
             origin: point(0.0, 0.0),
@@ -279,7 +307,11 @@ impl CosmicTextSystemState {
     /// keeping each instance under its own `FontId` is what lets shaping and
     /// glyph rasterization agree on the weight, since both are given nothing
     /// but a `FontId`.
-    fn font_id_at_weight(&mut self, matched: FontId, weight: cosmic_text::Weight) -> Result<FontId> {
+    fn font_id_at_weight(
+        &mut self,
+        matched: FontId,
+        weight: cosmic_text::Weight,
+    ) -> Result<FontId> {
         let loaded = self.loaded_font(matched);
         if loaded.weight == weight || !has_weight_axis(&loaded.font) {
             return Ok(matched);
@@ -309,7 +341,9 @@ impl CosmicTextSystemState {
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        let glyph_metrics = self.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
+        let loaded_font = self.loaded_font(font_id);
+        let coords = loaded_font.normalized_coords();
+        let glyph_metrics = loaded_font.font.as_swash().glyph_metrics(&coords);
         Ok(Size {
             width: glyph_metrics.advance_width(glyph_id.0 as u16),
             height: glyph_metrics.advance_height(glyph_id.0 as u16),
@@ -719,4 +753,89 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{FontWeight, font, px};
+
+    fn variable_font_system() -> CosmicTextSystem {
+        let system = CosmicTextSystem::new_without_system_fonts("GPUI Test Variable");
+        system
+            .add_fonts(vec![Cow::Borrowed(include_bytes!(
+                "../test_data/variable.ttf"
+            ))])
+            .expect("the bundled test font must load");
+        system
+    }
+
+    #[test]
+    fn variable_font_measurements_match_shaping() {
+        let system = variable_font_system();
+        let mut widths = Vec::new();
+        for weight in [FontWeight::NORMAL, FontWeight::SEMIBOLD, FontWeight::BOLD] {
+            let requested = Font {
+                weight,
+                ..font("GPUI Test Variable")
+            };
+            let font_id = system.font_id(&requested).unwrap();
+            assert_eq!(system.font_id(&requested).unwrap(), font_id);
+            for ch in ['M', 'm', '0'] {
+                let glyph_id = system.glyph_for_char(font_id, ch).unwrap();
+                let scale = 32. / system.font_metrics(font_id).units_per_em as f32;
+                let advance = system.advance(font_id, glyph_id).unwrap().width * scale;
+                let bounds = system.typographic_bounds(font_id, glyph_id).unwrap();
+                let layout =
+                    system.layout_line(&ch.to_string(), px(32.), &[FontRun { len: 1, font_id }]);
+                assert!((advance - f32::from(layout.width)).abs() < 0.01);
+                assert!((bounds.size.width * scale - advance).abs() < 0.01);
+                if ch == 'M' {
+                    widths.push(advance);
+                }
+            }
+        }
+        assert!(widths[0] < widths[1] && widths[1] < widths[2]);
+    }
+
+    #[test]
+    fn variable_font_metrics_use_the_requested_weight() {
+        let system = variable_font_system();
+        let regular = system.font_id(&font("GPUI Test Variable")).unwrap();
+        let bold = system
+            .font_id(&Font {
+                weight: FontWeight::BOLD,
+                ..font("GPUI Test Variable")
+            })
+            .unwrap();
+        assert_eq!(system.font_metrics(regular).underline_thickness, 140.);
+        assert_eq!(system.font_metrics(bold).underline_thickness, 190.);
+    }
+
+    #[test]
+    fn variable_font_rasterization_uses_the_requested_weight() {
+        let system = variable_font_system();
+        let mut images = Vec::new();
+        for weight in [FontWeight::NORMAL, FontWeight::BOLD] {
+            let font_id = system
+                .font_id(&Font {
+                    weight,
+                    ..font("GPUI Test Variable")
+                })
+                .unwrap();
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id: system.glyph_for_char(font_id, 'M').unwrap(),
+                font_size: px(32.),
+                subpixel_variant: point(0, 0),
+                scale_factor: 1.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+            };
+            let bounds = system.glyph_raster_bounds(&params).unwrap();
+            images.push(system.rasterize_glyph(&params, bounds).unwrap());
+        }
+        assert_ne!(images[0], images[1]);
+    }
 }
