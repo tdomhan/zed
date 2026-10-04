@@ -76,12 +76,6 @@ struct StateInner {
     follow_state: FollowState,
 }
 
-/// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
-///
-/// An absolute pending scroll preserves the same pixel offset into the item, which keeps
-/// visible text stable while content is appended to or removed from that item. A
-/// proportional pending scroll preserves the same fractional position within the item,
-/// which is useful when the whole list is being resized and each item scales similarly.
 /// An item to bring into view during the next layout, and optionally which
 /// part of it; see [`ListState::reveal_item_on_next_layout`].
 #[derive(Clone)]
@@ -90,6 +84,12 @@ struct PendingReveal {
     range_in_item: Option<Range<Pixels>>,
 }
 
+/// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
+///
+/// An absolute pending scroll preserves the same pixel offset into the item, which keeps
+/// visible text stable while content is appended to or removed from that item. A
+/// proportional pending scroll preserves the same fractional position within the item,
+/// which is useful when the whole list is being resized and each item scales similarly.
 #[derive(Clone)]
 enum PendingScroll {
     /// Preserve the same pixel offset into the item after it is remeasured.
@@ -927,63 +927,6 @@ impl StateInner {
         self.logical_scroll_top = Some(scroll_top);
     }
 
-    /// Move the scroll top so a vertical range of the item at `ix`, measured
-    /// from that item's top, is inside a viewport of `height` with `padding`.
-    ///
-    /// Unlike [`Self::reveal_item`], which works at whole items and so cannot
-    /// say anything about an item taller than the viewport, this scrolls the
-    /// least it can to bring the range itself into view, and leaves the scroll
-    /// top alone when the range is already inside.
-    fn reveal_range_in_item(
-        &mut self,
-        ix: usize,
-        range_in_item: Range<Pixels>,
-        height: Pixels,
-        padding: &Edges<Pixels>,
-    ) {
-        let (item_top, item_bottom) = {
-            let mut cursor = self.items.cursor::<ListItemSummary>(());
-            cursor.seek(&Count(ix), Bias::Right);
-            let top = cursor.start().height;
-            cursor.seek(&Count(ix + 1), Bias::Right);
-            (top, cursor.start().height)
-        };
-
-        // An item that fits is revealed whole. The range came from somewhere
-        // inside it, so showing all of it shows the range, without depending on
-        // what the caller measured the range from — the top of the item, or of
-        // some element within it. Only an item too tall to show at once needs
-        // the range to choose which part of it to bring into view.
-        if item_bottom - item_top <= height - padding.top - padding.bottom {
-            self.reveal_item(ix, height, padding);
-            return;
-        }
-
-        let mut scroll_top = self.logical_scroll_top();
-        let mut cursor = self.items.cursor::<ListItemSummary>(());
-
-        // A range reported against a stale layout can reach past the item it
-        // belongs to; it cannot mean anything outside it.
-        let target_top = (item_top + range_in_item.start).clamp(item_top, item_bottom);
-        let target_bottom = (item_top + range_in_item.end).clamp(target_top, item_bottom);
-
-        let current_top = self.scroll_top(&scroll_top);
-        let goal_top = if target_top < current_top {
-            target_top
-        } else {
-            let goal_top = px(0.).max(target_bottom + padding.top - height + padding.bottom);
-            if goal_top <= current_top {
-                return;
-            }
-            goal_top
-        };
-
-        cursor.seek(&Height(goal_top), Bias::Left);
-        scroll_top.item_ix = cursor.start().count;
-        scroll_top.offset_in_item = goal_top - cursor.start().height;
-        self.logical_scroll_top = Some(scroll_top);
-    }
-
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
@@ -1208,6 +1151,88 @@ impl StateInner {
         }
     }
 
+    fn apply_pending_reveal(
+        &mut self,
+        reveal: PendingReveal,
+        layout: &LayoutItemsResponse,
+        bounds: Bounds<Pixels>,
+        padding: &Edges<Pixels>,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if reveal.ix >= self.items.summary().count {
+            return false;
+        }
+
+        let available = size(bounds.size.width.into(), AvailableSpace::MinContent);
+        let mut cursor = self.items.cursor::<Count>(());
+        cursor.seek(&Count(reveal.ix), Bias::Right);
+        let item_size = cursor.item().and_then(ListItem::size).unwrap_or_else(|| {
+            render_item(reveal.ix, window, cx).layout_as_root(available, window, cx)
+        });
+        let height = bounds.size.height - padding.top - padding.bottom;
+        let range = if item_size.height <= height {
+            px(0.)..item_size.height
+        } else if let Some(range) = reveal.range_in_item {
+            let start = range.start.clamp(px(0.), item_size.height);
+            start..range.end.clamp(start, item_size.height)
+        } else {
+            px(0.)..item_size.height
+        };
+
+        // Off-screen focused items are appended to the layouts; exclude them from visibility.
+        let mut item_top = padding.top - layout.scroll_top.offset_in_item;
+        let mut target_top = None;
+        for (ix, item) in layout.item_layouts.iter().enumerate() {
+            if item.index != layout.scroll_top.item_ix + ix {
+                break;
+            }
+            if item.index == reveal.ix {
+                target_top = Some(item_top);
+                break;
+            }
+            item_top += item.size.height;
+        }
+
+        let reveal_top = if let Some(top) = target_top {
+            if top + range.start >= padding.top
+                && top + range.end <= bounds.size.height - padding.bottom
+            {
+                return false;
+            }
+            top + range.start < padding.top
+        } else {
+            reveal.ix < layout.scroll_top.item_ix
+        };
+
+        let scroll_top = if reveal_top {
+            ListOffset {
+                item_ix: reveal.ix,
+                offset_in_item: range.start,
+            }
+        } else {
+            // Anchor at the target and measure backwards only far enough to fill the viewport.
+            let mut remaining = height - range.end;
+            while remaining >= px(0.) {
+                cursor.prev();
+                let Some(item) = cursor.item() else { break };
+                let size = item.size().unwrap_or_else(|| {
+                    render_item(cursor.start().0, window, cx).layout_as_root(available, window, cx)
+                });
+                remaining -= size.height;
+            }
+            ListOffset {
+                item_ix: cursor.start().0,
+                offset_in_item: (-remaining).max(px(0.)),
+            }
+        };
+        self.pending_scroll = None;
+        self.follow_state.stop_following();
+        self.logical_scroll_top = Some(scroll_top);
+        true
+    }
+
     fn prepaint_items(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1233,6 +1258,29 @@ impl StateInner {
                 window,
                 cx,
             );
+
+            if bounds.size.height > padding.top + padding.bottom {
+                if let Some(reveal) = self.pending_reveal.take() {
+                    if self.apply_pending_reveal(
+                        reveal,
+                        &layout_response,
+                        bounds,
+                        &padding,
+                        render_item,
+                        window,
+                        cx,
+                    ) {
+                        layout_response = self.layout_items(
+                            Some(bounds.size.width),
+                            bounds.size.height,
+                            &padding,
+                            render_item,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
 
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
@@ -1475,18 +1523,6 @@ impl Element for List {
             .padding
             .to_pixels(bounds.size.into(), window.rem_size());
 
-        // These are the bounds a deferred reveal was waiting for. Resolving it
-        // here, before the items are laid out, keeps the requested item inside
-        // the very first layout at this size rather than the one after it.
-        if let Some(reveal) = state.pending_reveal.take() {
-            match reveal.range_in_item {
-                Some(range) => {
-                    state.reveal_range_in_item(reveal.ix, range, bounds.size.height, &padding)
-                }
-                None => state.reveal_item(reveal.ix, bounds.size.height, &padding),
-            }
-        }
-
         let layout =
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
@@ -1653,8 +1689,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Context, Element, FollowMode, InteractiveElement, IntoElement,
-        ListState, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-        TestAppContext, Window, div, list, point, px, size,
+        ListAlignment, ListOffset, ListState, ParentElement, Render, ScrollHandle,
+        StatefulInteractiveElement, Styled, TestAppContext, Window, div, list, point, px, size,
     };
 
     #[gpui::test]
@@ -1940,6 +1976,143 @@ mod test {
         });
         assert_eq!(state.logical_scroll_top().item_ix, 3);
         assert_eq!(state.logical_scroll_top().offset_in_item, px(50.));
+    }
+
+    struct RevealTestView {
+        state: ListState,
+        row_height: crate::Pixels,
+        tall_row_height: crate::Pixels,
+        padding: (crate::Pixels, crate::Pixels),
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl RevealTestView {
+        fn new(state: ListState) -> Self {
+            Self {
+                state,
+                row_height: px(10.),
+                tall_row_height: px(10.),
+                padding: (px(0.), px(0.)),
+                renders: Rc::new(Cell::new(0)),
+            }
+        }
+    }
+
+    impl Render for RevealTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let row_height = self.row_height;
+            let tall_row_height = self.tall_row_height;
+            list(self.state.clone(), {
+                let renders = self.renders.clone();
+                move |ix, _, _| {
+                    renders.set(renders.get() + 1);
+                    div()
+                        .h(if ix == 3 { tall_row_height } else { row_height })
+                        .into_any()
+                }
+            })
+            .w_full()
+            .h_full()
+            .pt(self.padding.0)
+            .pb(self.padding.1)
+        }
+    }
+
+    #[gpui::test]
+    fn test_reveal_on_next_layout_after_width_change(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, ListAlignment::Top, px(0.));
+        let view = cx.new(|_| RevealTestView::new(state.clone()));
+        let draw = |size, cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size, |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+        draw(size(px(100.), px(50.)), cx);
+        state.reveal_item_on_next_layout(4, None);
+        draw(size(px(90.), px(20.)), cx);
+        let bounds = state.bounds_for_item(4).unwrap();
+        assert!(bounds.top() >= px(0.) && bounds.bottom() <= px(20.));
+    }
+
+    #[gpui::test]
+    fn test_reveal_on_next_layout_measures_only_near_a_cold_target(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(10_000, ListAlignment::Top, px(0.));
+        let view = cx.new(|_| RevealTestView::new(state.clone()));
+        let renders = view.read_with(cx, |view, _| view.renders.clone());
+        state.reveal_item_on_next_layout(9_000, None);
+        cx.draw(point(px(0.), px(0.)), size(px(90.), px(20.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        let bounds = state.bounds_for_item(9_000).unwrap();
+        assert!(bounds.top() >= px(0.) && bounds.bottom() <= px(20.));
+        assert!(
+            renders.get() < 20,
+            "revealing must preserve list virtualization"
+        );
+    }
+
+    #[gpui::test]
+    fn test_reveal_on_next_layout_uses_reflowed_range_and_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, ListAlignment::Top, px(0.));
+        let view = cx.new(|_| RevealTestView {
+            tall_row_height: px(40.),
+            padding: (px(3.), px(7.)),
+            ..RevealTestView::new(state.clone())
+        });
+        let draw = |width, cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(width), px(50.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+        draw(100., cx);
+        view.update(cx, |view, _| view.tall_row_height = px(160.));
+        state.reveal_item_on_next_layout(3, Some(px(100.)..px(110.)));
+        draw(90., cx);
+        let bounds = state.bounds_for_item(3).unwrap();
+        assert!(bounds.top() + px(100.) >= px(3.));
+        assert!(bounds.top() + px(110.) <= px(43.));
+    }
+
+    #[gpui::test]
+    fn test_reveal_on_next_layout_wins_over_remeasurement_anchor(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, ListAlignment::Top, px(0.));
+        let view = cx.new(|_| RevealTestView {
+            row_height: px(160.),
+            tall_row_height: px(160.),
+            ..RevealTestView::new(state.clone())
+        });
+        let draw = |cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(90.), px(40.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+        state.scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(20.),
+        });
+        draw(cx);
+        state.remeasure();
+        state.reveal_item_on_next_layout(3, Some(px(100.)..px(110.)));
+        draw(cx);
+        assert_eq!(state.logical_scroll_top().item_ix, 3);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(70.));
+    }
+
+    #[gpui::test]
+    fn test_reveal_on_next_layout_ignores_removed_target(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, ListAlignment::Top, px(0.));
+        let view = cx.new(|_| RevealTestView::new(state.clone()));
+        state.reveal_item_on_next_layout(4, None);
+        state.reset(2);
+        cx.draw(point(px(0.), px(0.)), size(px(90.), px(20.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(state.logical_scroll_top().item_ix, 0);
     }
 
     #[gpui::test]
