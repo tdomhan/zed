@@ -485,9 +485,16 @@ impl CosmicTextSystemState {
         }
 
         let glyph_id: u16 = params.glyph_id.0.try_into()?;
-        renderer
+        let mut image = renderer
             .render(&mut scaler, glyph_id)
-            .with_context(|| format!("unable to render glyph via swash for {params:?}"))
+            .with_context(|| format!("unable to render glyph via swash for {params:?}"))?;
+        crate::sbix::correct_origin(
+            &mut image,
+            loaded_font.font.rustybuzz(),
+            glyph_id,
+            device_pixel_size,
+        );
+        Ok(image)
     }
 
     fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> Option<FontId> {

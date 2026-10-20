@@ -1,5 +1,6 @@
 #![cfg(target_os = "android")]
 mod android;
+mod sbix;
 
 pub use android::dispatcher::AndroidQueueReceiver;
 pub use android::ffi::{
